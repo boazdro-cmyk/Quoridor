@@ -1,15 +1,38 @@
-// src/index.js
+// Quoridor Multiplayer Cloudflare Worker
+// WebSocket: wss://quoridor.boazdro.workers.dev/ws
+
 export class QuoridorRoom {
   constructor(state, env) {
     this.state = state;
-    this.sessions = [];
-    this.gameState = {
+    this.env = env;
+    this.sessions = new Map(); // ws -> { roomCode, playerNum, name }
+    this.rooms = new Map();
+
+    // Global fallback room for clients that connect without creating/joining a room.
+    this.rooms.set("GLOBAL", this.newRoom("GLOBAL", "משחק", 2));
+  }
+
+  newRoom(code, name, maxPlayers = 2) {
+    return {
+      code,
+      name,
+      maxPlayers,
+      type: "room",
+      started: false,
+      createdAt: Date.now(),
+      players: [],
+      gameState: this.newGameState()
+    };
+  }
+
+  newGameState() {
+    return {
       boardSize: 9,
       players: {
         1: { r: 8, c: 4, walls: 10 },
         2: { r: 0, c: 4, walls: 10 }
       },
-      walls: [], // { r, c, type: 'v'|'h' }
+      walls: [],
       turn: 1,
       winner: null
     };
@@ -17,72 +40,513 @@ export class QuoridorRoom {
 
   async fetch(request) {
     if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("Expected WebSocket", { status: 426 });
+      return new Response("Quoridor WebSocket server is running", {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" }
+      });
     }
-    const [client, server] = Object.values(new WebSocketPair());
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
     await this.handleSession(server);
-    return new Response(null, { status: 101, webSocket: client });
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client
+    });
   }
 
   async handleSession(ws) {
     ws.accept();
-    this.sessions.push(ws);
-    
-    // Assign player number based on connection order
-    const playerNum = this.sessions.length <= 2 ? this.sessions.length : null;
-    ws.send(JSON.stringify({ type: "init", playerNum, gameState: this.gameState }));
 
-    ws.addEventListener("message", async (msg) => {
+    this.sessions.set(ws, {
+      roomCode: "GLOBAL",
+      playerNum: null,
+      name: "צופה"
+    });
+
+    ws.send(JSON.stringify({
+      type: "connected",
+      server: "quoridor.boazdro.workers.dev"
+    }));
+
+    ws.addEventListener("message", async event => {
       try {
-        const data = JSON.parse(msg.data);
-        if (data.type === "move" && this.gameState.turn === data.playerNum && !this.gameState.winner) {
-          // Update piece position
-          this.gameState.players[data.playerNum].r = data.r;
-          this.gameState.players[data.playerNum].c = data.c;
-          
-          // Check for win condition
-          if (data.playerNum === 1 && data.r === 0) this.gameState.winner = 1;
-          if (data.playerNum === 2 && data.r === 8) this.gameState.winner = 2;
-          
-          this.gameState.turn = this.gameState.turn === 1 ? 2 : 1;
-          this.broadcast({ type: "update", gameState: this.gameState });
-        } else if (data.type === "wall" && this.gameState.turn === data.playerNum && !this.gameState.winner) {
-          if (this.gameState.players[data.playerNum].walls > 0) {
-            this.gameState.walls.push({ r: data.r, c: data.c, type: data.wallType });
-            this.gameState.players[data.playerNum].walls--;
-            this.gameState.turn = this.gameState.turn === 1 ? 2 : 1;
-            this.broadcast({ type: "update", gameState: this.gameState });
-          }
-        }
-      } catch (e) {
-        console.error(e);
+        const data = JSON.parse(event.data);
+        await this.handleMessage(ws, data);
+      } catch (err) {
+        this.send(ws, {
+          type: "error",
+          message: "בקשה לא תקינה"
+        });
+        console.error(err);
       }
     });
 
     ws.addEventListener("close", () => {
-      this.sessions = this.sessions.filter(s => s !== ws);
+      const session = this.sessions.get(ws);
+      if (session) {
+        const room = this.rooms.get(session.roomCode);
+        if (room) {
+          room.players = room.players.filter(
+            p => p.playerNum !== session.playerNum || p.ws !== ws
+          );
+          this.broadcastRoom(session.roomCode, {
+            type: "room_update",
+            roomCode: session.roomCode,
+            players: this.publicPlayers(room),
+            playerCount: room.players.length
+          });
+        }
+      }
+      this.sessions.delete(ws);
     });
   }
 
-  broadcast(message) {
-    const payload = JSON.stringify(message);
-    for (const session of this.sessions) {
-      try { session.send(payload); } catch (e) {}
+  async handleMessage(ws, data) {
+    switch (data.type) {
+      case "room_create":
+        return this.createRoom(ws, data);
+
+      case "room_join":
+        return this.joinRoom(ws, data);
+
+      case "tournament_create":
+        return this.createTournament(ws, data);
+
+      case "game_start":
+        return this.startGame(ws, data);
+
+      case "move":
+        return this.handleMove(ws, data);
+
+      case "wall":
+        return this.handleWall(ws, data);
+
+      case "ping":
+        this.send(ws, { type: "pong" });
+        return;
+
+      default:
+        this.send(ws, {
+          type: "error",
+          message: "סוג הודעה לא מוכר: " + String(data.type || "")
+        });
     }
+  }
+
+  createRoom(ws, data) {
+    const name = this.cleanName(data.name);
+    const code = this.makeCode();
+
+    const room = this.newRoom(code, name + " - חדר", 2);
+    room.type = "room";
+    this.rooms.set(code, room);
+
+    this.addPlayer(ws, room, name, 1);
+
+    this.send(ws, {
+      type: "room_created",
+      roomCode: code,
+      playerNum: 1,
+      room: {
+        code,
+        name: room.name,
+        maxPlayers: 2,
+        players: this.publicPlayers(room)
+      }
+    });
+
+    this.sendRoomState(code);
+  }
+
+  joinRoom(ws, data) {
+    const code = String(data.roomCode || data.code || "").trim().toUpperCase();
+
+    if (!code) {
+      this.send(ws, { type: "error", message: "לא הוזן קוד חדר" });
+      return;
+    }
+
+    const room = this.rooms.get(code);
+
+    if (!room) {
+      this.send(ws, {
+        type: "error",
+        message: "החדר לא נמצא"
+      });
+      return;
+    }
+
+    if (room.players.length >= room.maxPlayers) {
+      this.send(ws, {
+        type: "error",
+        message: "החדר מלא"
+      });
+      return;
+    }
+
+    const playerNum = this.nextPlayerNumber(room);
+    if (playerNum == null) {
+      this.send(ws, {
+        type: "error",
+        message: "אין מקום לשחקן נוסף בחדר"
+      });
+      return;
+    }
+
+    this.addPlayer(ws, room, this.cleanName(data.name), playerNum);
+
+    this.send(ws, {
+      type: "room_joined",
+      roomCode: code,
+      playerNum,
+      room: {
+        code,
+        name: room.name,
+        maxPlayers: room.maxPlayers,
+        players: this.publicPlayers(room)
+      }
+    });
+
+    this.sendRoomState(code);
+
+    if (room.players.length >= 2 && room.maxPlayers === 2) {
+      room.started = true;
+      this.broadcastRoom(code, {
+        type: "game_start",
+        roomCode: code,
+        gameState: room.gameState
+      });
+    }
+  }
+
+  createTournament(ws, data) {
+    const name = this.cleanName(data.name);
+    const count = Math.max(
+      2,
+      Math.min(64, Number(data.playerCount) || 8)
+    );
+
+    const code = "T" + this.makeCode(5);
+    const room = this.newRoom(code, name + " - תחרות", count);
+    room.type = "tournament";
+    room.tournament = {
+      playerCount: count,
+      rounds: [],
+      status: "waiting"
+    };
+
+    this.rooms.set(code, room);
+    this.addPlayer(ws, room, name, 1);
+
+    this.send(ws, {
+      type: "tournament_created",
+      roomCode: code,
+      playerNum: 1,
+      tournament: {
+        code,
+        playerCount: count,
+        players: this.publicPlayers(room)
+      }
+    });
+
+    this.sendRoomState(code);
+  }
+
+  startGame(ws, data) {
+    const session = this.sessions.get(ws);
+    if (!session) return;
+
+    const code = String(data.roomCode || session.roomCode).toUpperCase();
+    const room = this.rooms.get(code);
+
+    if (!room) {
+      this.send(ws, { type: "error", message: "החדר לא נמצא" });
+      return;
+    }
+
+    room.started = true;
+
+    if (room.type === "tournament" && room.tournament) {
+      room.tournament.status = "started";
+    }
+
+    this.broadcastRoom(code, {
+      type: "game_start",
+      roomCode: code,
+      gameState: room.gameState
+    });
+  }
+
+  handleMove(ws, data) {
+    const session = this.sessions.get(ws);
+    if (!session || !session.playerNum) return;
+
+    const room = this.rooms.get(session.roomCode);
+    if (!room) return;
+
+    const n = Number(data.playerNum);
+    const r = Number(data.r);
+    const c = Number(data.c);
+
+    if (n !== session.playerNum) return;
+
+    if (room.gameState.winner) return;
+
+    if (room.gameState.turn !== n) {
+      this.send(ws, { type: "error", message: "זה לא התור שלך" });
+      return;
+    }
+
+    if (!room.gameState.players[n]) return;
+
+    const me = room.gameState.players[n];
+
+    if (!this.validCell(r, c) ||
+        Math.abs(me.r - r) + Math.abs(me.c - c) !== 1) {
+      this.send(ws, { type: "error", message: "מהלך לא חוקי" });
+      return;
+    }
+
+    if (this.isOccupied(room.gameState, r, c)) {
+      this.send(ws, { type: "error", message: "המשבצת תפוסה" });
+      return;
+    }
+
+    if (this.hasWallBetween(room.gameState, me.r, me.c, r, c)) {
+      this.send(ws, { type: "error", message: "יש קיר בדרך" });
+      return;
+    }
+
+    me.r = r;
+    me.c = c;
+
+    if (n === 1 && r === 0) room.gameState.winner = 1;
+    if (n === 2 && r === 8) room.gameState.winner = 2;
+
+    if (!room.gameState.winner) {
+      room.gameState.turn = n === 1 ? 2 : 1;
+    }
+
+    this.broadcastRoom(session.roomCode, {
+      type: "update",
+      gameState: room.gameState
+    });
+  }
+
+  handleWall(ws, data) {
+    const session = this.sessions.get(ws);
+    if (!session || !session.playerNum) return;
+
+    const room = this.rooms.get(session.roomCode);
+    if (!room) return;
+
+    const n = Number(data.playerNum);
+    const r = Number(data.r);
+    const c = Number(data.c);
+    const wallType = String(data.wallType || data.type || "").toLowerCase();
+
+    if (n !== session.playerNum) return;
+
+    if (room.gameState.winner) return;
+
+    if (room.gameState.turn !== n) {
+      this.send(ws, { type: "error", message: "זה לא התור שלך" });
+      return;
+    }
+
+    if (wallType !== "h" && wallType !== "v") {
+      this.send(ws, { type: "error", message: "סוג קיר לא תקין" });
+      return;
+    }
+
+    const player = room.gameState.players[n];
+
+    if (!player || player.walls <= 0) {
+      this.send(ws, { type: "error", message: "אין לך יותר קירות" });
+      return;
+    }
+
+    if (r < 0 || r > 7 || c < 0 || c > 7) {
+      this.send(ws, { type: "error", message: "מיקום קיר לא תקין" });
+      return;
+    }
+
+    const exists = room.gameState.walls.some(
+      w => w.r === r && w.c === c && w.type === wallType
+    );
+
+    if (exists) {
+      this.send(ws, { type: "error", message: "כבר יש קיר במקום הזה" });
+      return;
+    }
+
+    room.gameState.walls.push({
+      r,
+      c,
+      type: wallType
+    });
+
+    player.walls--;
+    room.gameState.turn = n === 1 ? 2 : 1;
+
+    this.broadcastRoom(session.roomCode, {
+      type: "update",
+      gameState: room.gameState
+    });
+  }
+
+  addPlayer(ws, room, name, playerNum) {
+    const old = this.sessions.get(ws);
+
+    if (old && old.roomCode !== room.code) {
+      const oldRoom = this.rooms.get(old.roomCode);
+      if (oldRoom) {
+        oldRoom.players = oldRoom.players.filter(p => p.ws !== ws);
+      }
+    }
+
+    const session = {
+      roomCode: room.code,
+      playerNum,
+      name
+    };
+
+    this.sessions.set(ws, session);
+
+    room.players = room.players.filter(p => p.ws !== ws);
+    room.players.push({
+      ws,
+      playerNum,
+      name
+    });
+  }
+
+  nextPlayerNumber(room) {
+    for (let i = 1; i <= room.maxPlayers; i++) {
+      if (!room.players.some(p => p.playerNum === i)) return i;
+    }
+    return null;
+  }
+
+  publicPlayers(room) {
+    return room.players.map(p => ({
+      playerNum: p.playerNum,
+      name: p.name
+    }));
+  }
+
+  sendRoomState(code) {
+    const room = this.rooms.get(code);
+    if (!room) return;
+
+    this.broadcastRoom(code, {
+      type: room.type === "tournament" ? "tournament_update" : "room_update",
+      roomCode: code,
+      players: this.publicPlayers(room),
+      playerCount: room.players.length,
+      maxPlayers: room.maxPlayers,
+      gameState: room.gameState
+    });
+  }
+
+  broadcastRoom(code, message) {
+    const payload = JSON.stringify(message);
+
+    for (const [ws, session] of this.sessions) {
+      if (session.roomCode !== code) continue;
+
+      try {
+        ws.send(payload);
+      } catch (e) {}
+    }
+  }
+
+  send(ws, message) {
+    try {
+      ws.send(JSON.stringify(message));
+    } catch (e) {}
+  }
+
+  cleanName(value) {
+    const s = String(value || "שחקן").trim().slice(0, 24);
+    return s || "שחקן";
+  }
+
+  makeCode(length = 6) {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let code = "";
+
+    do {
+      code = "";
+      for (let i = 0; i < length; i++) {
+        code += chars[Math.floor(Math.random() * chars.length)];
+      }
+    } while (this.rooms.has(code));
+
+    return code;
+  }
+
+  validCell(r, c) {
+    return Number.isInteger(r) &&
+           Number.isInteger(c) &&
+           r >= 0 && r < 9 &&
+           c >= 0 && c < 9;
+  }
+
+  isOccupied(state, r, c) {
+    return Object.values(state.players).some(
+      p => p.r === r && p.c === c
+    );
+  }
+
+  hasWallBetween(state, r1, c1, r2, c2) {
+    for (const w of state.walls) {
+      if (w.type === "h") {
+        if (r2 === r1 - 1 && w.r === r2 &&
+            (w.c === c1 || w.c === c1 - 1)) return true;
+
+        if (r2 === r1 + 1 && w.r === r1 &&
+            (w.c === c1 || w.c === c1 - 1)) return true;
+      }
+
+      if (w.type === "v") {
+        if (c2 === c1 - 1 && w.c === c2 &&
+            (w.r === r1 || w.r === r1 - 1)) return true;
+
+        if (c2 === c1 + 1 && w.c === c1 &&
+            (w.r === r1 || w.r === r1 - 1)) return true;
+      }
+    }
+
+    return false;
   }
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    
-    // Serve the HTML Frontend game board
+
     if (url.pathname === "/") {
-      return new Response(getHTML(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+      return new Response(
+        "Quoridor server is online. WebSocket endpoint: /ws",
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/plain; charset=utf-8"
+          }
+        }
+      );
     }
 
-    // Connect to WebSocket room
     if (url.pathname === "/ws") {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("Expected WebSocket", { status: 426 });
+      }
+
       const id = env.ROOM.idFromName("global_room");
       const roomObject = env.ROOM.get(id);
       return roomObject.fetch(request);
@@ -91,86 +555,3 @@ export default {
     return new Response("Not Found", { status: 404 });
   }
 };
-
-function getHTML() {
-  return `
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <meta charset="utf-8">
-    <title>קורידור אונליין</title>
-    <style>
-      body { font-family: sans-serif; text-align: center; background: #2c3e50; color: white; direction: rtl; }
-      #game-container { display: flex; flex-direction: column; align-items: center; margin-top: 20px; }
-      #board { display: grid; grid-template-columns: repeat(9, 50px); grid-template-rows: repeat(9, 50px); gap: 10px; background: #34495e; padding: 10px; border-radius: 8px; position: relative; }
-      .cell { background: #e0e0e0; border-radius: 4px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: background 0.2s; }
-      .cell:hover { background: #bdc3c7; }
-      .player { width: 35px; height: 35px; border-radius: 50%; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
-      .p1 { background: #e74c3c; }
-      .p2 { background: #3498db; }
-      #status { margin: 15px; font-size: 1.2rem; font-weight: bold; }
-    </style>
-  </head>
-  <body>
-    <h1>♟️ משחק קורידור מרובה משתתפים ♟️</h1>
-    <div id="status">מתחבר לשרת...</div>
-    <div id="game-container">
-      <div id="board"></div>
-    </div>
-
-    <script>
-      let ws = new WebSocket((window.location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws');
-      let myPlayerNum = null;
-      let state = null;
-
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'init') {
-          myPlayerNum = msg.playerNum;
-          state = msg.gameState;
-          document.getElementById('status').innerText = myPlayerNum ? 'אתה שחקן ' + myPlayerNum : 'אתה צופה במשחק';
-          renderBoard();
-        } else if (msg.type === 'update') {
-          state = msg.gameState;
-          renderBoard();
-        }
-      };
-
-      function renderBoard() {
-        const board = document.getElementById('board');
-        board.innerHTML = '';
-        
-        let turnText = state.winner ? '🏆 שחקן ' + state.winner + ' ניצח!' : 'תור שחקן: ' + state.turn;
-        document.getElementById('status').innerText = (myPlayerNum ? 'אתה שחקן ' + myPlayerNum + ' | ' : '') + turnText;
-
-        for (let r = 0; r < 9; r++) {
-          for (let c = 0; c < 9; c++) {
-            const cell = document.createElement('div');
-            cell.className = 'cell';
-            cell.dataset.r = r;
-            cell.dataset.c = c;
-
-            if (state.players[1].r === r && state.players[1].c === c) {
-              const p = document.createElement('div'); p.className = 'player p1'; cell.appendChild(p);
-            } else if (state.players[2].r === r && state.players[2].c === c) {
-              const p = document.createElement('div'); p.className = 'player p2'; cell.appendChild(p);
-            }
-
-            cell.onclick = () => {
-              if (state.turn !== myPlayerNum || state.winner) return;
-              // Simple valid move check (1 step away)
-              let myPos = state.players[myPlayerNum];
-              let dist = Math.abs(myPos.r - r) + Math.abs(myPos.c - c);
-              if (dist === 1) {
-                ws.send(JSON.stringify({ type: 'move', playerNum: myPlayerNum, r, c }));
-              }
-            };
-            board.appendChild(cell);
-          }
-        }
-      }
-    </script>
-  </body>
-  </html>
-  `;
-}

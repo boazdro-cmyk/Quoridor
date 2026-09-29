@@ -1,5 +1,5 @@
 {
-  "name": "quoridor",
+  "name": "quaridor",
   "main": "index.js",
   "compatibility_date": "2026-09-29",
   "durable_objects": {
@@ -13,7 +13,7 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["QuoridorRoom"]
+      "new_classes": ["QuoridorRoom"]
     }
   ]
 }
